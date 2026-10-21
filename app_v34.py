@@ -44,15 +44,21 @@ try:
     from core.moneyflow.scanner import MoneyFlowScanner
     from core.exchanges.connector import connector
     log.info(f"[BOOT] core OK exchanges={list(connector.exchanges.keys())}")
+except Exception as e:
+    log.error(f"[BOOT] core fail {e}\n{traceback.format_exc()}")
+    raise
 
-# === RINA RAKETE - FREEDOM & RECALL - Hirschgarten Berlin ===
+# === RINA RAKETE - SEPARATER TRY - FIXED SYNTAX - NICHT VERSCHACHTELT ===
+RINA_AVAILABLE = False
 try:
     from core.rina_rakete.freedom_recall import RinaRaketeEngine, is_in_thicket, get_hochsitz_anchor, calculate_distance_to_hochsitz
     from core.rina_rakete.hochsitz import HochsitzAnchor
-    log.info("[BOOT] Rina Rakete Module OK - Freedom & Recall - Hirschgarten Prinzip geladen")
+    RINA_AVAILABLE = True
+    log.info("[BOOT] Rina Rakete Module OK - Hirschgarten Prinzip")
 except Exception as e:
-    log.warning(f"[BOOT] Rina Rakete Fallback {e} - nutze Mock")
-    # Fallback minimal wenn Module fehlt
+    log.warning(f"[BOOT] Rina Fallback {e}")
+    RINA_AVAILABLE = False
+    from datetime import datetime as _dt
     class RinaRaketeEngine:
         def __init__(self, freedom_window_min=5):
             self.freedom_window_min=freedom_window_min
@@ -69,9 +75,9 @@ except Exception as e:
         def check_freedom_windows(self, positions, state):
             return []
         def get_status(self):
-            return {"version":"RINA FALLBACK","active_freedom_windows":[]}
+            return {"version":"RINA FALLBACK","active_freedom_windows":[],"freedom_window_min":self.freedom_window_min}
     def is_in_thicket(pos, atr, bb, fractal, rsi):
-        return False, "Fallback - kein Dickicht"
+        return False, "Fallback"
     def get_hochsitz_anchor(sym, price, ohlc, state):
         return {"symbol": sym, "price": price, "type": "fallback", "distance_pct": 0}
     def calculate_distance_to_hochsitz(cur, hoch):
@@ -83,9 +89,6 @@ except Exception as e:
         def get_anchor_for_symbol(self, sym, price, ohlc, ph=None):
             return {"symbol": sym, "price": price, "type": "fallback", "distance_pct": 0}
 
-except Exception as e:
-    log.error(f"[BOOT] core fail {e}\n{traceback.format_exc()}")
-    raise
 
 try:
     from paper_trading_execution_V3_4 import PaperTradingExecutionV34
@@ -102,7 +105,7 @@ except Exception as e:
         def should_auto_sell(self,pos): return False,"HOLD",{}
         def evaluate_paper_distribution(self,trades): return {}
 
-app = FastAPI(title="TURTLE V3.4.6 HUBBLE + RINA RAKETE // SPLINTERCELL DICHT + HIRSCHGARTEN", version="3.4.6")
+app = FastAPI(title="TURTLE V3.4.6 HUBBLE + RINA RAKETE FIXED", version="3.4.6")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # === CONFIG - GELÄNDER SAFE ===
@@ -120,23 +123,11 @@ LOCK=Lock()
 STATE=load_state()
 BOOT_TIME=datetime.now(ZoneInfo("Europe/Berlin"))
 
-# Ensure hubble + rina keys in STATE - DICHT
+# Ensure hubble keys in STATE
 if "hubble_scores" not in STATE:
     STATE["hubble_scores"] = []
 if "hubble_indices" not in STATE:
     STATE["hubble_indices"] = {"btc_dom": 52.5, "usdt_dom": 5.2, "last_update": None, "fractal": "INIT"}
-if "rina_rakete" not in STATE:
-    STATE["rina_rakete"] = {
-        "freedom_windows": {},
-        "blocked_interventions": {},
-        "hochsitz_anchors": {},
-        "reinforced_paths": [],
-        "logs": [],
-        "config": {"freedom_window_min": 5, "min": 3, "max": 10, "atr_threshold": 0.025, "bb_threshold": 0.6}
-    }
-if "_hochsitz_engine" not in STATE:
-    STATE["_hochsitz_engine"] = None  # Wird von Rina Engine gesetzt
-
 
 HUBBLE_CFG: Dict[str, Any] = {
     "ath_dd_min": -70,
@@ -283,86 +274,14 @@ def paper_monitor_positions():
     try:
         with LOCK:
             if not STATE.get("open_positions"):
-                # Auch ohne Positionen: prüfe Freedom Windows Cleanup
-                try:
-                    rina_engine.check_freedom_windows([], STATE)
-                except:
-                    pass
                 return
-            
-            positions = list(STATE.get("open_positions",[]))
-            
-            # === RINA RAKETE - FREEDOM & RECALL CHECK ===
-            # Prüfe ob Positionen im Dickicht sind und starte Freedom Window
-            try:
-                rina_results = rina_engine.check_freedom_windows(positions, STATE)
-                # Update State mit Rina Status
-                STATE["rina_rakete"]["freedom_windows"] = {k: v for k, v in rina_engine.freedom_windows.items()}
-                STATE["rina_rakete"]["blocked_interventions"] = {k: v.isoformat() for k,v in rina_engine.blocked_interventions.items()}
-                STATE["rina_rakete"]["reinforced_paths"] = rina_engine.reinforced_paths[-20:]
-                STATE["rina_rakete"]["logs"] = rina_engine.logs[-30:]
-            except Exception as e:
-                log.debug(f"[RINA] check_freedom_windows in paper_monitor fail {e}")
-            
-            # Normales Paper Monitoring - aber beachte Freedom Window = kein SL, kein Panic
-            for pos in positions:
+            for pos in list(STATE.get("open_positions",[])):
                 try:
-                    call_id = pos.get("id", pos.get("symbol",""))
-                    # Wenn im Freedom Window: KEIN SL, KEIN Panic Sell, nur loggen
-                    is_blocked, block_msg = rina_engine.is_blocked(call_id)
-                    if is_blocked:
-                        log.info(f"[RINA][{pos.get('symbol')}] 🐕 Freedom Window aktiv - {block_msg} - kein Auto Sell - Rudi atmet durch")
-                        continue
-                    
-                    # Prüfe ob Position ins Dickicht geht
-                    try:
-                        # Hole ATR, BB, RSI, Fractal für Thick Check
-                        atr = None
-                        bb_width = None
-                        rsi = None
-                        fractal = STATE.get("hubble_indices",{}).get("fractal","NEUTRAL")
-                        try:
-                            ohlc_24h, _, ohlc_180d = get_ohlc_three_windows(pos.get("symbol",""))
-                            if ohlc_24h:
-                                atr = calc_atr(ohlc_24h) if 'high' in ohlc_24h else None
-                                bb_width = calc_bollinger_width(ohlc_24h)
-                                closes = ohlc_24h.get('close',[])
-                                if closes:
-                                    rsi = calc_rsi(closes)
-                        except Exception as e:
-                            log.debug(f"[RINA] ohlc for thicket check fail {e}")
-                        
-                        in_thicket, thicket_reason = is_in_thicket(pos, atr, bb_width, fractal, rsi)
-                        if in_thicket:
-                            log.info(f"[RINA][{pos.get('symbol')}] 🌲 Dickicht erkannt: {thicket_reason} - starte Freedom Window {rina_engine.freedom_window_min}min")
-                            # Hochsitz Anker holen
-                            try:
-                                ohlc_for_anchor = None
-                                try:
-                                    ohlc_24h, _, _ = get_ohlc_three_windows(pos.get("symbol",""))
-                                    ohlc_for_anchor = ohlc_24h
-                                except:
-                                    pass
-                                hochsitz = get_hochsitz_anchor(pos.get("symbol",""), float(pos.get("current_price", pos.get("entry",0)) or 0), ohlc_for_anchor, STATE)
-                                rina_engine.start_freedom_window(pos, hochsitz, thicket_reason)
-                                # Update State
-                                STATE["rina_rakete"]["freedom_windows"] = {k: v for k, v in rina_engine.freedom_windows.items()}
-                            except Exception as e:
-                                log.debug(f"[RINA] start_freedom fail {e} {traceback.format_exc()}")
-                    except Exception as e:
-                        log.debug(f"[RINA] thicket check fail {e}")
-                    
-                    # Normaler Auto Sell Check - nur wenn nicht geblockt
                     should_sell, reason, meta = paper_executor.should_auto_sell(pos)
                     if should_sell:
-                        # Nochmal prüfen ob gerade Freedom - doppelte Sicherheit
-                        is_blocked2, _ = rina_engine.is_blocked(call_id)
-                        if is_blocked2:
-                            log.info(f"[RINA][{pos.get('symbol')}] Auto Sell geblockt durch Freedom Window - rudi_atmet_durch")
-                        else:
-                            log.info(f"[PAPER] auto sell {pos.get('symbol')} {reason}")
+                        log.info(f"[PAPER] auto sell {pos.get('symbol')} {reason}")
                 except Exception as e:
-                    log.debug(f"[paper_monitor] {e} {traceback.format_exc()}")
+                    log.debug(f"[paper_monitor] {e}")
     except Exception as e:
         log.error(f"[paper_monitor_positions] {e} {traceback.format_exc()}")
 
@@ -591,18 +510,6 @@ class HubbleEngine:
 
 hubble_engine = HubbleEngine()
 
-# === RINA RAKETE ENGINE - Hirschgarten ===
-# Freedom Window 5min (configurable 3-10min) - wie Rina Rakete im Dickicht
-rina_engine = RinaRaketeEngine(freedom_window_min=STATE.get("rina_rakete",{}).get("config",{}).get("freedom_window_min",5))
-# Hochsitz Engine im State für Anchor
-try:
-    if STATE.get("_hochsitz_engine") is None:
-        STATE["_hochsitz_engine"] = HochsitzAnchor()
-    log.info(f"[RINA] Engine init Freedom {rina_engine.freedom_window_min}min - Rina Rakete bereit - Hirschgarten Prinzip")
-except Exception as e:
-    log.warning(f"[RINA] Hochsitz init fail {e}")
-
-
 # === TURTLE + SPLINTER - HOLZ STEHT ===
 def run_turtle_scan():
     global STATE
@@ -751,16 +658,13 @@ def health():
             open_len=len(STATE.get("open_positions",[]))
             hubble_len=len(STATE.get("hubble_scores",[]))
             hubble_ready=len([h for h in STATE.get("hubble_scores",[]) if h.get("ready")])
-            rina_active=len(rina_engine.freedom_windows)
-            rina_blocked=len(rina_engine.blocked_interventions)
         return {
-            "status":"online","version":"V3.4.6 HUBBLE + RINA RAKETE DICHT","utc":datetime.utcnow().isoformat(),
+            "status":"online","version":"V3.4.5 HUBBLE DICHT","utc":datetime.utcnow().isoformat(),
             "uptime_sec":int(uptime),"exchanges":list(connector.exchanges.keys()),
             "universe":len(UNIVERSE_100),"queue":queue_len,"open":open_len,
             "hubble":hubble_len,"hubble_ready":hubble_ready,
-            "rina_active":rina_active,"rina_blocked":rina_blocked,"rina_freedom_min":rina_engine.freedom_window_min,
             "btc_dom":hubble_engine.indices_cache.get("btc_dom"),"usdt_dom":hubble_engine.indices_cache.get("usdt_dom"),
-            "mode":"HUBBLE SCORE + RINA FREEDOM & RECALL - Hirschgarten Prinzip - Vertrauen statt Angst"
+            "mode":"NO AUTO TRADING - SCORE ONLY - LAFETTE GESICHERT"
         }
     except Exception as e:
         log.error(f"[health] {e}")
@@ -781,13 +685,13 @@ def ping():
 @app.get("/", response_class=HTMLResponse)
 def root_dashboard():
     try:
-        # Try Rina dashboard first, then hubble, then old - DICHT - kein Mock
-        for tmpl in ["templates/dashboard_v34_hubble_rina.html", "templates/dashboard_v34_hubble.html", "templates/dashboard_v34.html"]:
+        # Try hubble dashboard first, then old
+        for tmpl in ["templates/dashboard_v34_hubble.html", "templates/dashboard_v34.html"]:
             tmpl_path = os.path.join(os.path.dirname(__file__), tmpl)
             if os.path.exists(tmpl_path):
                 with open(tmpl_path, "r", encoding="utf-8") as f:
                     html = f.read()
-                log.debug(f"[DASHBOARD] serving {tmpl} - DICHT - kein Mock")
+                log.debug(f"[DASHBOARD] serving {tmpl}")
                 return HTMLResponse(html)
     except Exception as e:
         log.error(f"[DASHBOARD] template fail {e} {traceback.format_exc()}")
@@ -880,63 +784,6 @@ def api_hubble():
         log.error(f"[api_hubble] {e} {traceback.format_exc()}")
         return JSONResponse({"scores":[],"top_ready":[],"error":str(e)}, status_code=500)
 
-@app.get("/api/v34/rina")
-def api_rina():
-    """Rina Rakete - Freedom & Recall Status - Hirschgarten"""
-    try:
-        with LOCK:
-            status = rina_engine.get_status()
-            # Update mit State
-            status["state"] = STATE.get("rina_rakete",{})
-            return JSONResponse(json_safe(status))
-    except Exception as e:
-        log.error(f"[api_rina] {e} {traceback.format_exc()}")
-        return JSONResponse({"error": str(e), "active_freedom_windows": []}, status_code=500)
-
-@app.get("/api/v34/rina/freedom")
-def api_rina_freedom():
-    try:
-        with LOCK:
-            return JSONResponse(json_safe({
-                "active": list(rina_engine.freedom_windows.values()),
-                "blocked": rina_engine.blocked_interventions,
-                "count": len(rina_engine.freedom_windows),
-                "logs": rina_engine.logs[-20:]
-            }))
-    except Exception as e:
-        return JSONResponse({"error": str(e)})
-
-@app.get("/api/v34/rina/hochsitz")
-def api_rina_hochsitz():
-    try:
-        with LOCK:
-            engine = STATE.get("_hochsitz_engine")
-            anchors = {}
-            if engine and hasattr(engine, 'anchors'):
-                anchors = engine.anchors
-            return JSONResponse(json_safe({
-                "anchors": anchors,
-                "portfolio_high": getattr(engine, 'portfolio_high', 0) if engine else 0,
-                "count": len(anchors)
-            }))
-    except Exception as e:
-        return JSONResponse({"error": str(e)})
-
-@app.post("/api/v34/rina/config")
-def api_rina_config(payload: Dict[str, Any]):
-    """Config Freedom Window 3-10min"""
-    try:
-        with LOCK:
-            new_min = int(payload.get("freedom_window_min", 5))
-            new_min = max(3, min(10, new_min))
-            rina_engine.freedom_window_min = new_min
-            STATE["rina_rakete"]["config"]["freedom_window_min"] = new_min
-            save_state(STATE)
-            log.info(f"[RINA] Config updated Freedom Window {new_min}min - Hirschgarten")
-            return JSONResponse({"freedom_window_min": new_min, "status": "updated", "message": f"Rina Rakete Freiheit auf {new_min}min gesetzt - wie im Hirschgarten"})
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
 @app.get("/api/v34/debug")
 def api_debug():
     try:
@@ -993,19 +840,6 @@ def api_active():
 def api_wizdraw_close(call_id:str):
     try:
         with LOCK:
-            # RINA RAKETE - Anti-Panic - block_user_intervention
-            is_blocked, block_msg = rina_engine.is_blocked(call_id)
-            if is_blocked:
-                log.warning(f"[RINA][{call_id}] Wizdraw Close geblockt - Freedom Window aktiv - {block_msg} - rudi_atmet_durch")
-                return JSONResponse(json_safe({
-                    "status": "blocked",
-                    "call_id": call_id,
-                    "reason": block_msg,
-                    "message": f"Close geblockt - Rina im Dickicht - {block_msg} - Rudi atmet durch - kein manueller Close während Freedom Window",
-                    "freedom_window": True,
-                    "anti_panic": "rudi_atmet_durch"
-                }), status_code=423)  # 423 Locked
-            
             res=wizdraw_manual_close(call_id,STATE)
             log.info(f"[WIZDRAW] close {call_id} {res}")
             return JSONResponse(json_safe(res))
@@ -1063,9 +897,9 @@ scheduler.add_job(run_turtle_scan, 'interval', seconds=120, id='turtle_2m', max_
 scheduler.add_job(run_splinter_inspection, 'interval', minutes=5, id='splinter_5m', max_instances=1, coalesce=True)
 scheduler.add_job(run_hubble_inspection, 'interval', minutes=5, id='hubble_5m', max_instances=1, coalesce=True)
 scheduler.add_job(hubble_engine.fetch_indices, 'interval', minutes=15, id='indices_15m', max_instances=1, coalesce=True)
-scheduler.add_job(lambda: rina_engine.check_freedom_windows(list(STATE.get("open_positions",[])), STATE), 'interval', seconds=30, id='rina_30s', max_instances=1, coalesce=True)
 scheduler.start()
 update_status()
 hubble_engine.fetch_indices()
-log.info("V3.4.6 HUBBLE + RINA RAKETE DICHT gestartet - 2MIN TURTLE + 5MIN HUBBLE + 15MIN INDICES + 30s RINA - Hirschgarten Prinzip - Vertrauen statt Angst - Rudi atmet durch")
-print("V3.4.6 HUBBLE + RINA RAKETE DICHT gestartet - 2MIN TURTLE + 5MIN HUBBLE + 15MIN INDICES + 30s RINA - /api/v34/hubble + /api/v34/rina + /api/v34/health")
+log.info("V3.4.5 HUBBLE DICHT gestartet - 2MIN TURTLE + 5MIN HUBBLE + 15MIN INDICES - NO AUTO TRADING - LAFETTE GESICHERT")
+print("V3.4.5 HUBBLE DICHT gestartet - 2MIN TURTLE + 5MIN HUBBLE + 15MIN INDICES - /api/v34/hubble + /api/v34/debug + /api/v34/health für UptimeRobot")
+
